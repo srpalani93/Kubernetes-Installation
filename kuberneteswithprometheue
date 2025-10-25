@@ -1,0 +1,284 @@
+#!/bin/bash
+# k8s-aws-setup-with-monitoring-final.sh
+
+set -e
+
+echo "=== Starting Kubernetes Setup with Monitoring ==="
+
+# Get AWS metadata
+PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+echo "Private IP: $PRIVATE_IP"
+echo "Public IP: $PUBLIC_IP"
+
+# Update system
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+
+# Disable swap permanently
+sudo swapoff -a
+sudo sed -i '/swap/d' /etc/fstab
+
+# Kernel modules and sysctl
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+
+sudo sysctl --system
+
+# Install containerd
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y containerd.io
+
+# Configure containerd for Kubernetes
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+# Install Kubernetes components
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+sudo apt-get install -y kubelet=1.28.0-1.1 kubeadm=1.28.0-1.1 kubectl=1.28.0-1.1
+sudo apt-mark hold kubelet kubeadm kubectl
+
+echo "=== Initializing Kubernetes Cluster ==="
+
+# Initialize cluster with correct CIDR for AWS
+sudo kubeadm init \
+  --pod-network-cidr=192.168.0.0/16 \
+  --apiserver-advertise-address=$PRIVATE_IP \
+  --control-plane-endpoint=$PRIVATE_IP
+
+# Setup kubeconfig
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+echo "=== Installing Calico CNI ==="
+
+# Install Calico with the standard manifest
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+
+# Wait for Calico to be ready
+echo "Waiting for Calico pods to be ready..."
+sleep 30
+kubectl wait --for=condition=ready pod -l k8s-app=calico-node -n kube-system --timeout=300s
+
+echo "=== Removing Control Plane Taint ==="
+kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+
+echo "=== Installing Kubernetes Dashboard ==="
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+
+echo "=== Creating Admin User ==="
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+EOF
+
+echo "=== Exposing Dashboard via NodePort ==="
+kubectl patch svc kubernetes-dashboard -n kubernetes-dashboard -p '{"spec": {"type": "NodePort"}}'
+
+echo "=== Installing Prometheus Stack ==="
+
+# Install Helm if not present
+if ! command -v helm &> /dev/null; then
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
+
+# Add Prometheus Helm repository
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# Create monitoring namespace
+kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+# Install kube-prometheus stack
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
+  --set prometheus.prometheusSpec.resources.requests.cpu=500m \
+  --set grafana.resources.requests.memory=256Mi \
+  --set grafana.resources.requests.cpu=100m \
+  --set grafana.adminPassword=admin \
+  --set grafana.service.type=NodePort \
+  --set prometheus.service.type=NodePort \
+  --set alertmanager.service.type=NodePort
+
+echo "=== Waiting for Monitoring Stack to be ready ==="
+sleep 30
+
+# Wait for Grafana
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=grafana -n monitoring --timeout=300s
+
+# Wait for Prometheus operator
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus -n monitoring --timeout=300s
+
+# Wait for Prometheus instance (using correct label)
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=prometheus -n monitoring --timeout=300s
+
+# Wait for alert manager
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=alertmanager -n monitoring --timeout=300s
+
+echo "=== Creating Sample Application for Monitoring ==="
+
+# Create a test namespace and deployment
+kubectl create namespace test-app --dry-run=client -o yaml | kubectl apply -f -
+
+# Deploy a sample nginx application
+cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  namespace: test-app
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+  namespace: test-app
+  labels:
+    app: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  type: ClusterIP
+EOF
+
+echo "=== Setting up ServiceMonitor for sample app ==="
+cat <<EOF | kubectl apply -f -
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nginx-monitor
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  namespaceSelector:
+    matchNames:
+    - test-app
+  endpoints:
+  - port: http
+    interval: 30s
+EOF
+
+echo "=== Waiting for final components ==="
+sleep 30
+
+echo "=== Verification Steps ==="
+echo "1. Checking cluster status..."
+kubectl get nodes
+kubectl get pods -A
+
+echo "2. Checking monitoring components..."
+kubectl get pods -n monitoring
+
+echo "3. Testing DNS resolution..."
+kubectl run dns-test --image=busybox --rm -it --restart=Never -- nslookup kubernetes.default.svc.cluster.local
+
+echo "=== Access Information ==="
+
+# Get NodePorts
+DASHBOARD_PORT=$(kubectl get svc -n kubernetes-dashboard kubernetes-dashboard -o jsonpath='{.spec.ports[0].nodePort}')
+GRAFANA_PORT=$(kubectl get svc -n monitoring prometheus-grafana -o jsonpath='{.spec.ports[0].nodePort}')
+PROMETHEUS_PORT=$(kubectl get svc -n monitoring prometheus-kube-prometheus-prometheus -o jsonpath='{.spec.ports[0].nodePort}')
+ALERTMANAGER_PORT=$(kubectl get svc -n monitoring prometheus-kube-prometheus-alertmanager -o jsonpath='{.spec.ports[0].nodePort}')
+
+# Get Grafana admin password
+GRAFANA_PASSWORD=$(kubectl get secret -n monitoring prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 -d)
+
+echo ""
+echo "=== Kubernetes Dashboard ==="
+echo "URL: https://${PUBLIC_IP}:${DASHBOARD_PORT}"
+echo "Token: kubectl -n kubernetes-dashboard create token admin-user"
+echo ""
+echo "=== Grafana Dashboard ==="
+echo "URL: http://${PUBLIC_IP}:${GRAFANA_PORT}"
+echo "Username: admin"
+echo "Password: ${GRAFANA_PASSWORD}"
+echo ""
+echo "=== Prometheus UI ==="
+echo "URL: http://${PUBLIC_IP}:${PROMETHEUS_PORT}"
+echo ""
+echo "=== AlertManager UI ==="
+echo "URL: http://${PUBLIC_IP}:${ALERTMANAGER_PORT}"
+echo ""
+echo "=== Useful Commands ==="
+echo "View all pods: kubectl get pods -A"
+echo "View monitoring pods: kubectl get pods -n monitoring"
+echo "Grafana logs: kubectl logs -n monitoring -l app.kubernetes.io/name=grafana"
+echo "Port-forward Grafana: kubectl port-forward -n monitoring svc/prometheus-grafana 3000:80"
+echo "Get dashboard token: kubectl -n kubernetes-dashboard create token admin-user"
+
+echo ""
+echo "=== Setup Complete ==="
+echo "All components installed successfully!"
+echo "Wait 2-3 minutes for all pods to be fully ready, then access the dashboards using the URLs above."
